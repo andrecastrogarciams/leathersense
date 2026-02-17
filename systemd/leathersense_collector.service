@@ -1,0 +1,20 @@
+[Unit]
+Description=LeatherSense Collector (DHT -> SQLite)
+After=local-fs.target
+
+[Service]
+Type=simple
+User=tap
+Group=tap
+WorkingDirectory=/home/tap/leathersense
+EnvironmentFile=/home/tap/leathersense/.env
+ExecStart=/home/tap/leathersense/venv/bin/python /home/tap/leathersense/collector.py
+Restart=always
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
