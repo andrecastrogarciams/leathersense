@@ -20,25 +20,25 @@ from common import (
 )
 
 # -----------------------------
-# Configurações (ENV)
+# Config (ENV)
 # -----------------------------
 DEVICE_KEY = os.getenv("DEVICE_KEY", "raspi-unknown")
 DEVICE_LOCATION = os.getenv("DEVICE_LOCATION", "") or None
 DEVICE_IP = os.getenv("DEVICE_IP", "") or None
 
 SYNC_INTERVAL_SECONDS = float(os.getenv("SYNC_INTERVAL_SECONDS", "5"))
-MYSQL_BATCH_SIZE = int(os.getenv("MYSQL_BATCH_SIZE", "200")) # Quantos registros enviar por vez
+MYSQL_BATCH_SIZE = int(os.getenv("MYSQL_BATCH_SIZE", "200"))
 MYSQL_CONNECT_TIMEOUT = int(os.getenv("MYSQL_CONNECT_TIMEOUT", "5"))
 MYSQL_SSL_DISABLED = os.getenv("MYSQL_SSL_DISABLED", "1") == "1"
 
-# Retenção: Evita que o cartão SD do Raspberry Pi lote
+# Retenção local
 ENABLE_RETENTION = os.getenv("ENABLE_RETENTION", "1") == "1"
-RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "90")) # Apaga dados locais após 90 dias
+RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "90"))
 
-# Dead-letter: Se um registro falhar 50 vezes (ex: erro de formato), ele é ignorado para não travar a fila
+# Dead-letter
 MAX_SYNC_ATTEMPTS = int(os.getenv("MAX_SYNC_ATTEMPTS", "50"))
 
-# Credenciais MySQL (Nuvem/Central)
+# MySQL
 MYSQL_ENABLED = os.getenv("MYSQL_ENABLED", "1") == "1"
 MYSQL_HOST = os.getenv("MYSQL_HOST", "")
 MYSQL_PORT = int(os.getenv("MYSQL_PORT", "3306"))
@@ -48,10 +48,9 @@ MYSQL_PASS = os.getenv("MYSQL_PASS", "")
 
 
 # -----------------------------
-# Operações SQLite (Local)
+# SQLite ops
 # -----------------------------
 def fetch_unsynced(conn: sqlite3.Connection, limit: int) -> list[tuple]:
-    """Busca registros que ainda não foram sincronizados e não estão 'mortos'."""
     cur = conn.execute(
         """
         SELECT reading_uuid, device_key, sensor_type, pin, ts_utc, temperature_c, humidity_pct, ok, error_msg, attempts
@@ -66,7 +65,6 @@ def fetch_unsynced(conn: sqlite3.Connection, limit: int) -> list[tuple]:
 
 
 def mark_synced(conn: sqlite3.Connection, uuids: list[str]) -> None:
-    """Marca com sucesso os registros enviados para a nuvem."""
     if not uuids:
         return
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -82,7 +80,6 @@ def mark_synced(conn: sqlite3.Connection, uuids: list[str]) -> None:
 
 
 def mark_attempt_failed(conn: sqlite3.Connection, logger: logging.Logger, uuids: list[str], reason: str) -> None:
-    """Incrementa o contador de tentativas quando o envio falha."""
     if not uuids:
         return
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -99,7 +96,6 @@ def mark_attempt_failed(conn: sqlite3.Connection, logger: logging.Logger, uuids:
 
 
 def mark_dead_if_exceeded(conn: sqlite3.Connection, logger: logging.Logger) -> None:
-    """Move registros problemáticos para o estado 'dead' para evitar loops infinitos de erro."""
     cur = conn.execute(
         """
         UPDATE queue_readings
@@ -114,7 +110,6 @@ def mark_dead_if_exceeded(conn: sqlite3.Connection, logger: logging.Logger) -> N
 
 
 def retention_cleanup(conn: sqlite3.Connection, logger: logging.Logger) -> None:
-    """Limpeza periódica: remove dados velhos que já foram sincronizados ou descartados."""
     if not ENABLE_RETENTION:
         return
     cutoff_epoch = int((datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).timestamp())
@@ -122,20 +117,22 @@ def retention_cleanup(conn: sqlite3.Connection, logger: logging.Logger) -> None:
         """
         DELETE FROM queue_readings
         WHERE ts_epoch_utc < ?
-        AND (synced=1 OR dead=1)
+          AND (synced=1 OR dead=1)
         """,
         (cutoff_epoch,),
     )
     conn.commit()
     if cur.rowcount:
-        logger.info("Retention local: removidos %s registros < epoch=%s", cur.rowcount, cutoff_epoch)
+        logger.info("Retention local: removidos %s registros (synced/dead) < epoch=%s", cur.rowcount, cutoff_epoch)
 
 
 # -----------------------------
-# Operações MySQL (Remoto)
+# MySQL ops (compatível com seu schema)
+# devices(id, device_key, location, ip, created_at)
+# sensors(id, device_id, sensor_type, pin, label, created_at)
+# readings(... reading_uuid UNIQUE recomendado, sensor_id FK sensors.id, ts_utc, temperature_c, humidity_pct, ok, error_msg)
 # -----------------------------
 def mysql_connect():
-    """Cria conexão com o servidor MySQL central."""
     kwargs = dict(
         host=MYSQL_HOST,
         port=MYSQL_PORT,
@@ -153,7 +150,6 @@ def mysql_connect():
 
 
 def ensure_device(cur, device_key: str, location: str | None, ip: str | None) -> int:
-    """Garante que o Raspberry Pi está cadastrado na tabela de devices da nuvem (Upsert)."""
     cur.execute(
         """
         INSERT INTO devices (device_key, location, ip)
@@ -172,7 +168,7 @@ def ensure_device(cur, device_key: str, location: str | None, ip: str | None) ->
 
 
 def ensure_sensor(cur, device_id: int, sensor_type: str, pin: str, label: str) -> int:
-    """Garante que o sensor (DHT11/22) está cadastrado na nuvem vinculado a este dispositivo."""
+    # tenta achar primeiro (evita duplicata se não tiver UNIQUE)
     cur.execute(
         "SELECT id FROM sensors WHERE device_id=%s AND sensor_type=%s AND pin=%s ORDER BY id DESC LIMIT 1",
         (device_id, sensor_type, pin),
@@ -181,76 +177,136 @@ def ensure_sensor(cur, device_id: int, sensor_type: str, pin: str, label: str) -
     if row:
         return int(row[0])
 
+    # cria
     cur.execute(
-        "INSERT INTO sensors (device_id, sensor_type, pin, label) VALUES (%s, %s, %s, %s)",
+        """
+        INSERT INTO sensors (device_id, sensor_type, pin, label)
+        VALUES (%s, %s, %s, %s)
+        """,
         (device_id, sensor_type, pin, label),
     )
     return int(cur.lastrowid)
 
 
+def push_batch_mysql(cur, batch: list[tuple]) -> None:
+    """
+    batch: (reading_uuid, sensor_id, ts_utc, temperature_c, humidity_pct, ok, error_msg)
+    Recomendado ter UNIQUE(reading_uuid) na readings pra idempotência.
+    """
+    cur.executemany(
+        """
+        INSERT INTO readings (reading_uuid, sensor_id, ts_utc, temperature_c, humidity_pct, ok, error_msg)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON DUPLICATE KEY UPDATE
+          temperature_c = VALUES(temperature_c),
+          humidity_pct  = VALUES(humidity_pct),
+          ok            = VALUES(ok),
+          error_msg     = VALUES(error_msg)
+        """,
+        batch,
+    )
+
+
+def is_transient_mysql_error(e: MySQLError) -> bool:
+    # heurística simples (conexão, timeout, servidor caiu)
+    transient_errnos = {1040, 1042, 1047, 1053, 1152, 1153, 1205, 1213, 2002, 2003, 2013}
+    try:
+        return getattr(e, "errno", None) in transient_errnos
+    except Exception:
+        return False
+
+
 def push_with_split(cur, batch: list[tuple]) -> None:
     """
-    Técnica de Divisão de Lote: Se o MySQL rejeitar o lote (ex: um registro corrompido),
-    ele divide o lote ao meio e tenta novamente. Isso isola o registro problemático (poison pill).
+    Se 1 linha quebrar, divide o lote pra isolar poison pill.
     """
     if not batch:
         return
     try:
-        cur.executemany(
-            """
-            INSERT INTO readings (reading_uuid, sensor_id, ts_utc, temperature_c, humidity_pct, ok, error_msg)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON DUPLICATE KEY UPDATE
-              temperature_c = VALUES(temperature_c), ok = VALUES(ok)
-            """,
-            batch,
-        )
+        push_batch_mysql(cur, batch)
+        return
     except MySQLError:
         if len(batch) == 1:
-            raise # Se sobrou só um e deu erro, ele será tratado pelo contador de attempts
+            raise
         mid = len(batch) // 2
         push_with_split(cur, batch[:mid])
         push_with_split(cur, batch[mid:])
 
 
 # -----------------------------
-# Loop Principal
+# Main loop
 # -----------------------------
 RUNNING = True
+
 
 def handle_stop(signum, frame):
     global RUNNING
     RUNNING = False
 
+
+def mysql_config_ok() -> tuple[bool, str]:
+    missing = []
+    if not MYSQL_HOST:
+        missing.append("MYSQL_HOST")
+    if not MYSQL_USER:
+        missing.append("MYSQL_USER")
+    if not MYSQL_PASS:
+        missing.append("MYSQL_PASS")
+    if not MYSQL_DB:
+        missing.append("MYSQL_DB")
+    ok = (len(missing) == 0)
+    report = f"MYSQL_ENABLED={'1' if MYSQL_ENABLED else '0'} | HOST={MYSQL_HOST or '<vazio>'} | DB={MYSQL_DB or '<vazio>'} | USER={MYSQL_USER or '<vazio>'} | PASS={'<set>' if MYSQL_PASS else '<vazio>'} | MISSING={','.join(missing) if missing else '-'}"
+    return ok, report
+
+
 def main():
     setup_dirs()
     logger = setup_logger("leathersense_sync", "sync.log")
-    
+
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
 
     conn_sqlite = sqlite_connect()
-    
-    # Verifica se as configurações do MySQL estão presentes
-    mysql_ready = MYSQL_ENABLED and MYSQL_HOST and MYSQL_USER
+    init_sqlite_queue(conn_sqlite)
+    logger.info("SQLite OK: %s", SQLITE_PATH)
+
+    cfg_ok, cfg_report = mysql_config_ok()
+    if not MYSQL_ENABLED:
+        logger.warning("MySQL desabilitado (MYSQL_ENABLED=0). Sync não rodará.")
+    elif not cfg_ok:
+        logger.warning("Sync OFF: config MySQL incompleta/ inválida | %s", cfg_report)
+
+    mysql_ready = MYSQL_ENABLED and cfg_ok
 
     mysql_fail_count = 0
     next_try = 0.0
+
     last_maintenance_date = None
 
+    logger.info(
+        "Sync iniciado | device=%s | sqlite=%s | mysql=%s | intervalo=%ss",
+        DEVICE_KEY,
+        SQLITE_PATH,
+        "ON" if mysql_ready else "OFF",
+        SYNC_INTERVAL_SECONDS,
+    )
+
     while RUNNING:
-        # Rotina diária de manutenção do banco local
+        # manutenção diária (retention + deadletter)
         today = datetime.now(timezone.utc).date()
         if last_maintenance_date != today:
             retention_cleanup(conn_sqlite, logger)
             mark_dead_if_exceeded(conn_sqlite, logger)
             last_maintenance_date = today
 
-        if not mysql_ready or time.time() < next_try:
+        if not mysql_ready:
+            time.sleep(max(2, SYNC_INTERVAL_SECONDS))
+            continue
+
+        if time.time() < next_try:
             time.sleep(1.0)
             continue
 
-        # Pega um lote de registros pendentes
         rows = fetch_unsynced(conn_sqlite, MYSQL_BATCH_SIZE)
         if not rows:
             time.sleep(SYNC_INTERVAL_SECONDS)
@@ -265,36 +321,64 @@ def main():
             ip = DEVICE_IP or get_local_ip() or None
             device_id = ensure_device(cur, DEVICE_KEY, DEVICE_LOCATION, ip)
 
-            # Prepara o lote vinculando cada leitura ao ID do sensor no MySQL
-            sensor_cache = {}
-            batch = []
-            for (r_uuid, d_key, s_type, pin, ts, t, h, ok, err, att) in rows:
-                key = (s_type, pin)
-                if key not in sensor_cache:
-                    sensor_cache[key] = ensure_sensor(cur, device_id, s_type, pin, f"{s_type}@{pin}")
-                
-                batch.append((r_uuid, sensor_cache[key], ts, t, h, ok, err))
+            # cache local (sensor_type,pin)->sensor_id
+            sensor_cache: dict[tuple[str, str], int] = {}
 
-            # Envia para a nuvem
+            batch = []
+            for (reading_uuid, device_key, sensor_type, pin, ts_utc, t, h, ok, err, attempts) in rows:
+                key = (sensor_type, pin)
+                if key not in sensor_cache:
+                    label = f"{sensor_type}@{pin}"
+                    sensor_cache[key] = ensure_sensor(cur, device_id, sensor_type, pin, label)
+
+                sensor_id = sensor_cache[key]
+                batch.append((reading_uuid, sensor_id, ts_utc, t, h, ok, err))
+
+            # envia lote (com split se der ruim)
             push_with_split(cur, batch)
             conn_mysql.commit()
-            
-            # Se chegou aqui, deu certo: atualiza SQLite
+            cur.close()
+            conn_mysql.close()
+
             mark_synced(conn_sqlite, uuids)
+
             mysql_fail_count = 0
+            next_try = time.time()
             logger.info("Sync MySQL OK | enviados=%s", len(uuids))
 
-        except (MySQLError, sqlite3.OperationalError) as e:
+        except MySQLError as e:
             mysql_fail_count += 1
-            # Backoff Exponencial: espera mais tempo a cada erro seguido (até 5 min)
             wait = min(300, 2 ** min(mysql_fail_count, 8))
             next_try = time.time() + wait
-            mark_attempt_failed(conn_sqlite, logger, uuids, str(e))
-            logger.warning("Erro no Sync. Próxima tentativa em %ss", wait)
-        
-        finally:
-            # Garante fechamento das conexões em cada ciclo
-            if 'cur' in locals(): cur.close()
-            if 'conn_mysql' in locals(): conn_mysql.close()
 
-    conn_sqlite.close()
+            # Se for erro "transiente", não é culpa de dado
+            mark_attempt_failed(conn_sqlite, logger, uuids, f"MySQL: {e}")
+
+            # Se for transiente, não vale “punir” demais; mas como já incrementa attempts,
+            # o dead-letter só bate em 50+ tentativas.
+            logger.warning("Retry em %ss (fail_count=%s)", wait, mysql_fail_count)
+
+        except sqlite3.OperationalError as e:
+            # ex: database is locked
+            mysql_fail_count += 1
+            wait = min(30, 2 ** min(mysql_fail_count, 5))
+            next_try = time.time() + wait
+            logger.warning("SQLite OperationalError: %s | retry em %ss", e, wait)
+
+        except Exception as e:
+            mysql_fail_count += 1
+            wait = min(300, 2 ** min(mysql_fail_count, 8))
+            next_try = time.time() + wait
+            mark_attempt_failed(conn_sqlite, logger, uuids, f"Exception: {e}")
+            logger.warning("Retry em %ss (fail_count=%s)", wait, mysql_fail_count)
+
+    logger.info("Encerrando sync...")
+    try:
+        conn_sqlite.close()
+    except Exception:
+        pass
+    logger.info("Finalizado.")
+
+
+if __name__ == "__main__":
+    main()
